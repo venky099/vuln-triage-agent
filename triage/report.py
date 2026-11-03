@@ -1,30 +1,45 @@
-"""Report rendering: Markdown, HTML and JSON."""
+"""Report rendering formats: Markdown, HTML, and JSON."""
 from __future__ import annotations
 
 import html
 import json
+import re
 from datetime import datetime, timezone
+from typing import Any
 
 from .agent import TriageResult
 
-BADGE = {"Critical": "#b21f2d", "High": "#c9600a", "Medium": "#9a7d09",
-         "Low": "#0a63c9", "None": "#6b7280"}
+BADGE: dict[str, str] = {
+    "Critical": "#b21f2d",
+    "High": "#c9600a",
+    "Medium": "#9a7d09",
+    "Low": "#0a63c9",
+    "None": "#6b7280",
+}
 
 
 def _today() -> str:
+    """Return the current UTC date formatted as YYYY-MM-DD."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _clean_target(target: str) -> str:
+    """Sanitize target string to prevent line breaks or layout breaking characters."""
+    cleaned = re.sub(r"[\r\n]+", " ", (target or "").strip())
+    return cleaned[:200] if cleaned else "Unspecified target"
+
+
 def to_markdown(result: TriageResult, target: str = "") -> str:
+    """Render a TriageResult into a formatted Markdown report."""
     counts = result.counts()
+    target_str = _clean_target(target)
     lines = [
         "# Vulnerability Assessment Report",
         "",
-        "**Target:** {}  ".format(target or "not specified"),
-        "**Date:** {}  ".format(_today()),
-        "**Findings:** {} ({} duplicate{} merged)".format(
-            len(result.findings), result.duplicates_removed,
-            "" if result.duplicates_removed == 1 else "s"),
+        f"**Target:** {target_str}  ",
+        f"**Date:** {_today()}  ",
+        f"**Findings:** {len(result.findings)} ({result.duplicates_removed} duplicate"
+        f"{'' if result.duplicates_removed == 1 else 's'} merged)",
         "",
         "## Executive summary",
         "",
@@ -33,49 +48,50 @@ def to_markdown(result: TriageResult, target: str = "") -> str:
     top = result.findings[0] if result.findings else None
     if top and top.severity in ("Critical", "High"):
         lines.append(
-            "The assessment identified **{} critical** and **{} high** severity issues. "
-            "The most serious is *{}*, scoring {} ({}). Issues at this level should be "
-            "remediated before the next release.".format(
-                counts["Critical"], counts["High"], top.title, top.cvss_score, top.severity))
+            f"The assessment identified **{counts['Critical']} critical** and **{counts['High']} high** severity issues. "
+            f"The most serious is *{top.title}*, scoring {top.cvss_score} ({top.severity}). Issues at this level should be "
+            "remediated before the next release."
+        )
     elif result.findings:
         lines.append(
-            "No critical or high severity issues were identified. {} finding(s) of medium "
-            "severity or below are listed below.".format(len(result.findings)))
+            f"No critical or high severity issues were identified. {len(result.findings)} finding(s) of medium "
+            "severity or below are listed below."
+        )
     else:
         lines.append("No findings were reported by the scanner.")
 
     lines += ["", "| Severity | Count |", "|---|---|"]
     for sev in ("Critical", "High", "Medium", "Low", "None"):
         if counts.get(sev):
-            lines.append("| {} | {} |".format(sev, counts[sev]))
+            lines.append(f"| {sev} | {counts[sev]} |")
 
     if result.flagged:
         lines += [
             "",
-            "> **{} finding(s) contain claims that could not be traced to the scan "
-            "data.** They are marked below and must be reviewed before this report "
-            "is sent.".format(len(result.flagged)),
+            f"> **{len(result.flagged)} finding(s) contain claims that could not be traced to the scan "
+            "data.** They are marked below and must be reviewed before this report is sent.",
         ]
 
     lines += ["", "## Findings", ""]
     for i, f in enumerate(result.findings, 1):
         lines += [
-            "### {}. {}".format(i, f.title),
+            f"### {i}. {f.title}",
             "",
-            "**Severity:** {} ({})  ".format(f.severity, f.cvss_score),
-            "**CVSS v3.1:** `{}`  ".format(f.cvss_vector),
+            f"**Severity:** {f.severity} ({f.cvss_score})  ",
+            f"**CVSS v3.1:** `{f.cvss_vector}`  ",
         ]
         if f.cwe_id:
-            lines.append("**Weakness:** {} — {}  ".format(f.cwe_id, f.cwe_name))
-        lines.append("**Source:** {}{}".format(
-            f.source_id,
-            " (also seen as {})".format(", ".join(f.duplicates)) if f.duplicates else ""))
-        lines += ["", f.summary, "",
-                  "**Reproduction**", "", f.reproduction, "",
-                  "**Remediation**", "", f.remediation, ""]
+            lines.append(f"**Weakness:** {f.cwe_id} — {f.cwe_name}  ")
+        lines.append(f"**Source:** {f.source_id}" +
+                     (f" (also seen as {', '.join(f.duplicates)})" if f.duplicates else ""))
+        lines += [
+            "", f.summary, "",
+            "**Reproduction**", "", f.reproduction, "",
+            "**Remediation**", "", f.remediation, "",
+        ]
         if f.flags:
             lines += ["**⚠ Needs review before sending:**", ""]
-            lines += ["- {}".format(flag) for flag in f.flags]
+            lines += [f"- {flag}" for flag in f.flags]
             lines.append("")
         lines.append("---")
         lines.append("")
@@ -89,45 +105,49 @@ def to_markdown(result: TriageResult, target: str = "") -> str:
         "before inclusion. Claims that could not be traced are flagged above rather "
         "than silently removed.",
         "",
-        "Backend: `{}`. Schema retries: {}.".format(result.backend, result.schema_retries),
+        f"Backend: `{result.backend}`. Schema retries: {result.schema_retries}.",
     ]
     return "\n".join(lines)
 
 
 def to_html(result: TriageResult, target: str = "") -> str:
+    """Render a TriageResult into a standalone, styled HTML report."""
     counts = result.counts()
     rows = []
     for i, f in enumerate(result.findings, 1):
-        flags = ""
+        flags_html = ""
         if f.flags:
-            flags = ("<div class='flags'><b>Needs review before sending</b><ul>"
-                     + "".join("<li>{}</li>".format(html.escape(x)) for x in f.flags)
-                     + "</ul></div>")
+            flags_html = (
+                "<div class='flags'><b>Needs review before sending</b><ul>"
+                + "".join(f"<li>{html.escape(x)}</li>" for x in f.flags)
+                + "</ul></div>"
+            )
+
+        badge_color = BADGE.get(f.severity, "#6b7280")
+        cwe_part = (
+            f" &middot; {html.escape(str(f.cwe_id))} {html.escape(f.cwe_name)}"
+            if f.cwe_id else ""
+        )
+
         rows.append(
             "<article class='finding'>"
-            "<div class='head'><span class='sev' style='background:{c}'>{sev} {score}</span>"
-            "<h3>{i}. {title}</h3></div>"
-            "<p class='meta'><code>{vec}</code>{cwe} &middot; source {src}</p>"
-            "<p>{summary}</p>"
-            "<h4>Reproduction</h4><p>{repro}</p>"
-            "<h4>Remediation</h4><p>{fix}</p>{flags}</article>".format(
-                # BADGE.get() constrains the colour to a known palette value, but
-                # every *interpolated* field is escaped: /api/render accepts a
-                # client-supplied result, so severity, score and cwe_id are all
-                # attacker-controlled in that path.
-                c=BADGE.get(f.severity, "#6b7280"),
-                sev=html.escape(str(f.severity)), score=html.escape(str(f.cvss_score)), i=i,
-                title=html.escape(f.title), vec=html.escape(f.cvss_vector),
-                cwe=" &middot; {} {}".format(html.escape(str(f.cwe_id)), html.escape(f.cwe_name))
-                    if f.cwe_id else "",
-                src=html.escape(f.source_id), summary=html.escape(f.summary),
-                repro=html.escape(f.reproduction), fix=html.escape(f.remediation), flags=flags))
+            f"<div class='head'><span class='sev' style='background:{badge_color}'>"
+            f"{html.escape(str(f.severity))} {html.escape(str(f.cvss_score))}</span>"
+            f"<h3>{i}. {html.escape(f.title)}</h3></div>"
+            f"<p class='meta'><code>{html.escape(f.cvss_vector)}</code>{cwe_part} &middot; source {html.escape(f.source_id)}</p>"
+            f"<p>{html.escape(f.summary)}</p>"
+            f"<h4>Reproduction</h4><p>{html.escape(f.reproduction)}</p>"
+            f"<h4>Remediation</h4><p>{html.escape(f.remediation)}</p>{flags_html}</article>"
+        )
 
     summary_cells = "".join(
-        "<div class='stat'><span style='color:{}'>{}</span><small>{}</small></div>".format(
-            BADGE[s], counts[s], s) for s in ("Critical", "High", "Medium", "Low") if counts.get(s))
+        f"<div class='stat'><span style='color:{BADGE[s]}'>{counts[s]}</span><small>{s}</small></div>"
+        for s in ("Critical", "High", "Medium", "Low") if counts.get(s)
+    )
 
-    return """<!doctype html><html><head><meta charset="utf-8">
+    clean_target_str = html.escape(_clean_target(target))
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Vulnerability Assessment Report</title><style>
 :root{{--bg:#fff;--fg:#14161d;--muted:#5b6472;--line:#e4e7ee;--card:#fafbfd}}
 @media(prefers-color-scheme:dark){{:root{{--bg:#0d0f14;--fg:#e8eaf0;--muted:#98a1b0;--line:#252a34;--card:#141821}}}}
@@ -151,23 +171,20 @@ code{{font-family:ui-monospace,Consolas,monospace;font-size:.82em}}
 footer{{color:var(--muted);font-size:.84rem;margin-top:30px;border-top:1px solid var(--line);padding-top:16px}}
 </style></head><body><div class="wrap">
 <h1>Vulnerability Assessment Report</h1>
-<p class="sub">{target} &middot; {date} &middot; {n} findings, {dupes} duplicates merged</p>
-<div class="stats">{stats}</div>
-{rows}
+<p class="sub">{clean_target_str} &middot; {_today()} &middot; {len(result.findings)} findings, {result.duplicates_removed} duplicates merged</p>
+<div class="stats">{summary_cells}</div>
+{''.join(rows)}
 <footer>Triaged with an LLM under a fixed output schema. CVSS scores are computed from the
 selected metrics by code, never stated by the model. Every claim is checked against the scanner
 output and a local CWE catalogue; untraceable claims are flagged, not silently dropped.
-Backend: <code>{backend}</code>. Schema retries: {retries}.</footer>
-</div></body></html>""".format(
-        target=html.escape(target or "Unspecified target"), date=_today(),
-        n=len(result.findings), dupes=result.duplicates_removed,
-        stats=summary_cells, rows="".join(rows),
-        backend=result.backend, retries=result.schema_retries)
+Backend: <code>{html.escape(result.backend)}</code>. Schema retries: {result.schema_retries}.</footer>
+</div></body></html>"""
 
 
 def to_json(result: TriageResult, target: str = "") -> str:
+    """Serialize a TriageResult to JSON format."""
     return json.dumps({
-        "target": target,
+        "target": _clean_target(target),
         "generated": _today(),
         "backend": result.backend,
         "counts": result.counts(),

@@ -1,13 +1,14 @@
-"""Tools the agent may call.
+"""Deterministic security tools and utilities for the triage pipeline.
 
-The division of labour matters more than the code here. The model decides
-*judgement* things ("is confidentiality impact high?"). Code decides *factual*
-things (what score those metrics produce, whether a CWE exists). A model that
-is never asked to state a number can never invent one.
+Handles factual computations:
+- CVSS v3.1 vector scoring (Appendix A compliant arithmetic)
+- CWE catalogue verification
+- Scanner finding deduplication
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from pathlib import Path
@@ -15,33 +16,37 @@ from typing import Any
 
 from .models import RawFinding
 
+logger = logging.getLogger(__name__)
+
 DATA = Path(__file__).resolve().parent.parent / "data"
 
 # --------------------------------------------------------------------------
-# CWE catalogue  (grounding source #2 — the scan data is source #1)
+# CWE catalogue lookup
 # --------------------------------------------------------------------------
 
 _CWE_CACHE: dict[str, dict[str, str]] | None = None
 
 
 def cwe_catalogue() -> dict[str, dict[str, str]]:
+    """Return the cached CWE dictionary loaded from data/cwe.json."""
     global _CWE_CACHE
     if _CWE_CACHE is None:
-        _CWE_CACHE = json.loads((DATA / "cwe.json").read_text(encoding="utf-8"))
+        cwe_file = DATA / "cwe.json"
+        if not cwe_file.exists():
+            raise FileNotFoundError(f"Authoritative CWE catalogue not found at {cwe_file}")
+        _CWE_CACHE = json.loads(cwe_file.read_text(encoding="utf-8"))
     return _CWE_CACHE
 
 
 def lookup_cwe(cwe_id: str) -> dict[str, str] | None:
-    """Return the catalogue entry, or None if this CWE is not one we know.
-
-    None is the important case: it means the model produced an identifier that
-    does not exist in our source of truth, and the claim gets blocked.
-    """
-    return cwe_catalogue().get((cwe_id or "").strip().upper())
+    """Return the catalogue entry for the given CWE ID, or None if unknown."""
+    if not cwe_id:
+        return None
+    return cwe_catalogue().get(cwe_id.strip().upper())
 
 
 # --------------------------------------------------------------------------
-# CVSS v3.1 base score
+# CVSS v3.1 base score computation
 # --------------------------------------------------------------------------
 
 _AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}
@@ -58,7 +63,7 @@ VECTOR_RE = re.compile(
 
 
 def _roundup(value: float) -> float:
-    """CVSS v3.1 Appendix A roundup — integer arithmetic, not round()."""
+    """Perform CVSS v3.1 Appendix A round-up calculation using integer arithmetic."""
     i = int(round(value * 100000))
     if i % 10000 == 0:
         return i / 100000.0
@@ -66,40 +71,46 @@ def _roundup(value: float) -> float:
 
 
 def build_vector(m: dict[str, str]) -> str:
-    return ("CVSS:3.1/AV:{AV}/AC:{AC}/PR:{PR}/UI:{UI}/"
-            "S:{S}/C:{C}/I:{I}/A:{A}").format(**m)
+    """Format an 8-metric dictionary into a standardized CVSS v3.1 vector string."""
+    return (
+        "CVSS:3.1/AV:{AV}/AC:{AC}/PR:{PR}/UI:{UI}/"
+        "S:{S}/C:{C}/I:{I}/A:{A}"
+    ).format(**m)
 
 
 def score_cvss(vector: str) -> tuple[float, str]:
-    """Compute the base score and severity rating from a v3.1 vector.
+    """Compute CVSS v3.1 base score and qualitative severity rating from a vector.
 
-    Raises ValueError on a malformed vector, which is itself a useful signal:
-    a model that invents a vector usually gets the shape subtly wrong.
+    Raises ValueError if the vector does not match the official CVSS 3.1 specification.
     """
     match = VECTOR_RE.match((vector or "").strip())
     if not match:
-        raise ValueError(f"malformed CVSS v3.1 vector: {vector!r}")
+        raise ValueError(f"Malformed or unsupported CVSS v3.1 vector: {vector!r}")
+
     av, ac, pr, ui, scope, c, i, a = match.groups()
 
-    iss = 1 - ((1 - _CIA[c]) * (1 - _CIA[i]) * (1 - _CIA[a]))
+    iss = 1.0 - ((1.0 - _CIA[c]) * (1.0 - _CIA[i]) * (1.0 - _CIA[a]))
     if scope == "U":
         impact = 6.42 * iss
     else:
-        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
 
-    exploitability = 8.22 * _AV[av] * _AC[ac] * (_PR_U if scope == "U" else _PR_C)[pr] * _UI[ui]
+    pr_val = _PR_U[pr] if scope == "U" else _PR_C[pr]
+    exploitability = 8.22 * _AV[av] * _AC[ac] * pr_val * _UI[ui]
 
     if impact <= 0:
         score = 0.0
     elif scope == "U":
-        score = _roundup(min(impact + exploitability, 10))
+        score = _roundup(min(impact + exploitability, 10.0))
     else:
-        score = _roundup(min(1.08 * (impact + exploitability), 10))
+        score = _roundup(min(1.08 * (impact + exploitability), 10.0))
+
     return score, severity_of(score)
 
 
 def severity_of(score: float) -> str:
-    if score == 0:
+    """Map a CVSS numeric score to its qualitative severity rating."""
+    if score == 0.0:
         return "None"
     if score < 4.0:
         return "Low"
@@ -115,17 +126,17 @@ def severity_of(score: float) -> str:
 # --------------------------------------------------------------------------
 
 def _dedupe_key(f: RawFinding) -> tuple[str, str, str]:
-    """Same bug class, same endpoint, same parameter = the same finding.
+    """Derive unique identity: vulnerability kind, normalized URL path, parameter.
 
-    Query strings are stripped: a scanner that walks ?id=1 and ?id=2 reports
-    the same injection twice, and a report that lists it twice looks careless.
+    Query parameters and fragments are stripped from the URL to merge repeated
+    findings on the same endpoint.
     """
     path = re.sub(r"[?#].*$", "", f.url or "").rstrip("/").lower()
     return (f.kind.strip().lower(), path, (f.parameter or "").strip().lower())
 
 
 def dedupe(findings: list[RawFinding]) -> list[tuple[RawFinding, list[str]]]:
-    """Return [(kept_finding, [ids_it_absorbed]), ...] preserving input order."""
+    """Group duplicate findings, returning [(representative_finding, [absorbed_ids])]."""
     groups: dict[tuple[str, str, str], list[RawFinding]] = {}
     order: list[tuple[str, str, str]] = []
     for f in findings:
@@ -138,14 +149,13 @@ def dedupe(findings: list[RawFinding]) -> list[tuple[RawFinding, list[str]]]:
 
 
 # --------------------------------------------------------------------------
-# Tool descriptions, for backends that support native tool calling
+# Tool definitions for function calling
 # --------------------------------------------------------------------------
 
 TOOL_SPECS: list[dict[str, Any]] = [
     {
         "name": "lookup_cwe",
-        "description": "Look up a CWE identifier in the local catalogue. "
-                       "Returns null if the CWE is not present, which means it must not be cited.",
+        "description": "Look up a CWE identifier in the authoritative local catalogue.",
         "parameters": {
             "type": "object",
             "properties": {"cwe_id": {"type": "string", "description": "e.g. CWE-89"}},
@@ -154,8 +164,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
     },
     {
         "name": "score_cvss",
-        "description": "Compute the CVSS v3.1 base score and severity from a vector string. "
-                       "Always use this; never state a score yourself.",
+        "description": "Compute the CVSS v3.1 base score and severity from a vector string.",
         "parameters": {
             "type": "object",
             "properties": {"vector": {"type": "string"}},

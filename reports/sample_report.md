@@ -1,7 +1,7 @@
 # Vulnerability Assessment Report
 
 **Target:** https://demo.vulnerable.example  
-**Date:** 2026-08-20  
+**Date:** 2026-11-03  
 **Findings:** 5 (1 duplicate merged)
 
 ## Executive summary
@@ -36,6 +36,7 @@ Use parameterised queries so id is bound as a value and never parsed as SQL.
 **⚠ Needs review before sending:**
 
 - CWE not in catalogue: CWE-781
+- classification mismatch: scanner reported 'SQL Injection' (commonly CWE-89), but finding was assigned CWE-781 — manual verification recommended
 
 ---
 

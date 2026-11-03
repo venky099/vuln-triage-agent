@@ -1,14 +1,38 @@
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.env
-
-# `pip install -e .` (README quickstart and CI both run it) drops this here
+*$py.class
 *.egg-info/
 build/
 dist/
 
-# Local tool state, not project content
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration & secrets
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite3
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Tool-specific state
 .claude/settings.local.json
+prompt*.md
+

@@ -306,3 +306,129 @@ def test_flooding_the_table_cannot_reset_someone_elses_limit():
     with pytest.raises(Rejected):
         lim.check("victim")
     assert len(lim._hits) <= 10
+
+
+# --------------------------- Render Endpoint & Concurrency Hardening ---------------------------
+
+def test_render_rejects_oversized_title():
+    finding = {
+        "source_id": "T-1",
+        "title": "A" * 350,
+        "cwe_id": "CWE-89",
+        "cvss_score": 9.8,
+        "severity": "Critical",
+        "summary": "Summary text",
+        "reproduction": "Repro step",
+        "remediation": "Remediation guidance",
+    }
+    r = client.post("/api/render", json={"payload": {"grounded": [finding]}, "format": "markdown"})
+    assert r.status_code == 400
+
+
+def test_render_rejects_out_of_range_cvss_score():
+    finding = {
+        "source_id": "T-1",
+        "title": "SQL Injection",
+        "cwe_id": "CWE-89",
+        "cvss_score": 15.0,
+        "severity": "Critical",
+        "summary": "Summary text",
+        "reproduction": "Repro step",
+        "remediation": "Remediation guidance",
+    }
+    r = client.post("/api/render", json={"payload": {"grounded": [finding]}, "format": "markdown"})
+    assert r.status_code == 400
+    assert "Invalid CVSS score" in r.json()["error"]
+
+
+def test_render_rejects_invalid_cwe_shape():
+    finding = {
+        "source_id": "T-1",
+        "title": "SQL Injection",
+        "cwe_id": "CWE-NOT-A-NUMBER",
+        "cvss_score": 9.8,
+        "severity": "Critical",
+        "summary": "Summary text",
+        "reproduction": "Repro step",
+        "remediation": "Remediation guidance",
+    }
+    r = client.post("/api/render", json={"payload": {"grounded": [finding]}, "format": "markdown"})
+    assert r.status_code == 400
+    assert "Invalid CWE identifier shape" in r.json()["error"]
+
+
+def test_render_rejects_non_list_grounded():
+    r = client.post("/api/render", json={"payload": {"grounded": "not a list"}, "format": "markdown"})
+    assert r.status_code == 400
+    assert "array" in r.json()["error"]
+
+
+def test_to_markdown_sanitizes_newlines_in_target():
+    from triage.agent import TriageResult
+    from triage.models import TriagedFinding
+    from triage.report import to_markdown
+
+    f = TriagedFinding(
+        source_id="T-1",
+        title="SQL Injection",
+        cwe_id="CWE-89",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        cvss_score=9.8,
+        severity="Critical",
+        summary="Concatenation flaw.",
+        reproduction="Submit payload.",
+        remediation="Parameterize.",
+    )
+    md = to_markdown(TriageResult(findings=[f]), target="evil.example\n\n## Injected Section")
+    assert "\n\n## Injected Section" not in md
+    assert "**Target:** evil.example ## Injected Section" in md
+
+
+def test_rate_limiter_multithreaded_concurrency():
+    import concurrent.futures
+
+    lim = RateLimiter(max_calls=50, window_seconds=60)
+    errors = []
+
+    def hit(client_id):
+        try:
+            lim.check(client_id)
+        except Exception as exc:
+            errors.append(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(hit, f"client-{i % 5}") for i in range(100)]
+        concurrent.futures.wait(futures)
+
+    # Some will be Rejected (due to hitting limit of 50 per client), but no internal concurrency errors
+    for err in errors:
+        assert isinstance(err, Rejected)
+
+
+def test_bug5_webui_partial_finding_failure_resilience(monkeypatch):
+    """Bug 5: An unprocessable finding in web triage does not discard successful findings."""
+    from triage.agent import TriageAgent
+
+    original_triage_one = TriageAgent.triage_one
+
+    call_count = 0
+    def flaky_triage_one(self, raw, duplicates=None):
+        nonlocal call_count
+        call_count += 1
+        if raw.id == "VS-004":
+            raise RuntimeError("Temporary provider processing error")
+        return original_triage_one(self, raw, duplicates)
+
+    monkeypatch.setattr(TriageAgent, "triage_one", flaky_triage_one)
+
+    r = triage()
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    # The other findings succeeded and are returned
+    assert len(body["grounded"]) > 0
+    source_ids = [f["source_id"] for f in body["grounded"]]
+    assert "VS-004" not in source_ids
+    assert "VS-001" in source_ids
+
+

@@ -1,407 +1,338 @@
-# AI Vulnerability Triage Agent
+# Vulnerability Triage Agent
 
-[![tests](https://github.com/venky099/vuln-triage-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/venky099/vuln-triage-agent/actions/workflows/tests.yml)
+An automated, AI-assisted vulnerability triage system that transforms raw security scanner findings into client-ready penetration testing reports while enforcing deterministic grounding checks to prevent LLM hallucinations.
 
-Turns raw scanner output into a client-ready pentest report — and **measures how
-often the model makes things up**, then stops it.
+---
 
-```
-$ vulntriage data/sample_scan.json --target demo.vulnerable.example
+## 1. Project Overview
 
-Backend: mock | 6 findings in
-  [1/5] VS-001 SQL Injection
-  [2/5] VS-003 Reflected XSS
-  ...
+Modern vulnerability scanners produce high volumes of raw findings that require manual interpretation, deduplication, weakness categorization, CVSS scoring, reproduction documentation, and remediation recommendations.
 
-5 findings (1 duplicates merged) | 1 critical, 0 high, 4 medium, 0 low
-2 finding(s) contain ungrounded claims and are flagged for review
-```
+The **Vulnerability Triage Agent** automates this pipeline using language models under strict constraints:
+- **Judgement is separated from calculation:** Models select CVSS v3.1 qualitative metrics, but base scores are derived strictly by code.
+- **Claims are verified against ground truth:** Every CVE reference, CWE identifier, URL endpoint, and impact claim is validated against raw scanner evidence and an authoritative CWE catalogue.
+- **Hallucinations are detected and redacted:** Untraceable or fabricated citations are flagged for human review and redacted from final reports.
 
-Sample output: [`reports/sample_report.md`](reports/sample_report.md) ·
-[HTML](reports/sample_report.html) · [JSON](reports/sample_report.json)
+---
 
-<details>
-<summary><b>New to this? The whole idea, in plain language</b> — no security background needed</summary>
+## 2. Problem Statement
 
-<br>
+Automating security report generation with LLMs introduces significant operational risk:
+1. **Fabricated CVE Citations:** Under pressure to provide authoritative references, LLMs often hallucinate nonexistent CVE numbers (e.g., claiming a custom web application flaw corresponds to `CVE-2019-4471`).
+2. **Incorrect CVSS Math:** Generative models are notoriously unreliable at arithmetic, frequently inventing inconsistent base scores and severity ratings.
+3. **Misclassification & Scope Drift:** Models often confuse vulnerability types (e.g., assigning Path Traversal to a SQL injection) or fabricate endpoints never touched during the assessment.
+4. **Self-Auditing Failure:** Asking an LLM if its own output is factual fails because the model generates confident justifications for its own fabrications.
 
-**In one sentence:** a model writes the security report, and a second, much dumber
-piece of code checks every fact it wrote and crosses out anything it cannot prove.
+---
 
-### What a scanner is
+## 3. Key Features
 
-Imagine a robot that walks around your house at night testing things, and comes back
-with a list:
+- **Multi-Scanner Ingestion:** Supports VibeScanner, Burp Suite (Professional XML/JSON & Enterprise REST), OWASP ZAP, and Nmap JSON formats.
+- **Intelligent Deduplication:** Merges identical vulnerability findings across repeated endpoints and query parameters.
+- **Schema-Enforced Elicitation:** Constrains LLM completions to a strict JSON Schema, automatically retrying with diagnostic feedback on validation errors.
+- **Deterministic CVSS v3.1 Calculator:** Implements FIRST CVSS v3.1 Appendix A formulas to compute exact base scores and qualitative severity ratings.
+- **Deterministic Grounding Verification:** Validates every generated statement against scanner evidence and a local CWE catalogue without relying on LLM self-evaluation.
+- **Dual-View Inspection Interface:** A FastAPI-based web UI that provides side-by-side comparison between raw model output and grounded results.
+- **Multi-Format Export:** Generates standardized Markdown, self-contained responsive HTML, and structured JSON reports.
+- **Zero-Dependency Core CLI:** Core triage, scoring, and report generation run on the Python standard library without requiring external packages or API keys.
 
-```
-kitchen window  - unlocked
-back door       - lock is broken
-garage keypad   - shows the code as you type it
-```
+---
 
-That is a vulnerability scanner, except for websites. It finds problems, but describes
-them in robot-speak: `param id vulnerable to SQLi, payload 1' OR '1'='1`.
+## 4. System Architecture
 
-### The existing problem
+The following diagram illustrates how raw scanner inputs flow through parsing, agent orchestration, verification checks, and final report rendering:
 
-A robot list is useless to the person who has to fix things. What they need is:
+```mermaid
+flowchart TD
+    ScannerInput["Scanner Input (JSON)<br/>(VibeScanner, Burp, ZAP, Nmap)"] --> InputParser["Input Parser<br/>(triage/parsers.py)"]
+    InputParser --> RawFindings["Normalized RawFinding Objects"]
+    RawFindings --> DedupeModule["Deduplication<br/>(Kind + Normalized Path + Param)"]
+    DedupeModule --> TriageAgent["Vulnerability Triage Agent<br/>(triage/agent.py)"]
 
-> **The kitchen window does not lock.** Anyone in the back alley can push it open in
-> about two seconds and climb in. This is serious — 8 out of 10. Replace the latch
-> with a keyed model; about £15.
+    subgraph LLM_Pipeline ["Model Analysis & Schema Validation"]
+        TriageAgent --> LLMContext["Context & Schema Prompting"]
+        LLMContext --> LLMBackend["LLM Backend<br/>(OpenAI / Ollama / Mock)"]
+        LLMBackend --> SchemaValidator["Schema Validator<br/>(TRIAGE_SCHEMA enforcement)"]
+        SchemaValidator -- "Feedback & Retry" --> LLMContext
+    end
 
-Writing *that*, for every item, for every client, is where most of the billable time
-on an assessment goes. It is slow, it is the same shape every time, and that makes it
-a job for a computer.
+    SchemaValidator --> GroundingModule["Grounding & Verification Layer<br/>(triage/grounding.py)"]
 
-### Why the obvious fix explodes
+    subgraph Grounding_Validation ["Authoritative Ground Truth Checks"]
+        GroundingModule <--> ScanTruth["Scanner Corpus (Source of Truth #1)"]
+        GroundingModule <--> CWECatalogue["CWE Catalogue (Source of Truth #2)"]
+        GroundingModule --> ConsistencyCheck["CWE Classification Consistency & Impact Checks"]
+    end
 
-Hand the list to an LLM and say "write this up." It does — beautifully. And then,
-somewhere in the middle, it writes:
-
-> The `id` parameter is vulnerable to SQL injection. **This corresponds to CVE-2019-4471.**
-
-`CVE-2019-4471` is an official worldwide ID for a known bug, like an ISBN for a book.
-**It does not exist.** The model invented it.
-
-A model does not *know* things; it is an extremely good guesser of the next word. It
-has read millions of security reports, and in those, "this corresponds to…" is nearly
-always followed by `CVE-` and eight digits. So it produces some. That is not lying —
-lying requires knowing the truth.
-
-**The analogy:** a kid who skimmed the book writes *"as the author says on page 94,
-'the river remembers everything.'"* There is no page 94 quote. But the sentence sounds
-exactly like every real book report they have read, so out it comes — in the same
-confident voice as all the true sentences around it. **The invented sentence looks
-identical to the real ones.** No wobble in the handwriting, no "um."
-
-And that is the real damage: the client googles the CVE, finds nothing, and now
-distrusts the *entire* report — because they have no way to tell which other parts
-were invented. One fake fact poisons fifty true ones.
-
-### The proposed solution: three rules
-
-**Rule 1 — a form to fill in, never a blank page.** The model gets fixed boxes: title,
-bug type, summary, how to repeat it, how to fix it. A blank sheet lets a kid write
-fiction; a form with labelled boxes does not — and if they scribble outside the boxes,
-**you can see it immediately.** Free-form prose gives you nothing to check against.
-When the form comes back wrong, the program says exactly what was wrong and asks again.
-
-**Rule 2 — the model is never allowed to say a number.** Every bug gets a danger score
-out of 10. The model never states it. It only answers questions it is genuinely good
-at — can this be attacked over the internet? does the victim have to click something?
-could private data be read? — and then **code does the arithmetic** and gets `9.8`.
-Like a teacher who never asks "what grade do you deserve?" but asks "did you hand in
-all six assignments?" and works it out. A model never asked for a number cannot invent
-one. The form does not even have a box for it.
-
-**Rule 3 — every fact must trace to a source, or it is struck out.** Exactly two things
-are allowed to be true: what the scanner actually saw, and a local list of 16 known bug
-types. Anything else the model asserts is treated as invented — a CVE that appears
-nowhere in the scan, a bug type not on the list, a web address the scanner never
-visited, a score that disagrees with the maths, or a scary phrase like "full system
-compromise" that one scanner finding cannot possibly prove.
-
-Struck out **visibly**, not quietly deleted:
-
-```
-This corresponds to [UNVERIFIED REFERENCE REMOVED].
-
-⚠ invented CVE reference: CVE-2019-3253
+    ConsistencyCheck --> CVSSCalculator["CVSS v3.1 Arithmetic<br/>(triage/tools.py - Code, Not Model)"]
+    CVSSCalculator --> TriagedResult["Triaged Finding & Warning Flags"]
+    TriagedResult --> ReportGenerator["Report Generator<br/>(triage/report.py)"]
+    ReportGenerator --> CLIOut["CLI Output<br/>(stdout / Markdown / HTML / JSON)"]
+    ReportGenerator --> WebUIOut["Interactive Web Dashboard<br/>(FastAPI / Vanilla JS)"]
 ```
 
-A teacher who silently erases the fake quote teaches nobody anything, and the report
-still *looks* perfect. Red pen and a note means everyone can see something was wrong.
-**A safety net you cannot see is worse than none**, because it stops you looking.
+---
 
-### The cleverest part
+## 5. Technology Stack
 
-Why not just ask the model "are you sure that CVE is real?"
+- **Core & Runtime:** Python 3.10+ (standard library: `dataclasses`, `json`, `urllib`, `argparse`, `math`, `re`)
+- **Web Interface:** FastAPI, Starlette, Jinja2, Uvicorn
+- **Supported LLM Backends:**
+  - `openai`: OpenAI API (`gpt-4o-mini`, `gpt-4o`) via `openai` Python SDK
+  - `ollama`: Local offline inference (`llama3.2`, `mistral`) via standard HTTP API
+  - `mock`: Seeded, deterministic simulation for CI and repeatable evaluations
+- **Testing & Quality:** Pytest, HTTPX
 
-**Because it will say yes.** The same guessing machine that produced the fake code will
-produce a confident confirmation — it is the same process running twice. Asking a kid
-to proofread their own invented quote gets you the quote plus a signature. So all the
-checking happens in plain, boring, non-AI code, against data the model cannot influence.
-Dumb code that can only look things up beats smart code that can imagine things.
+---
 
-### The honest failure, which is the most useful part
-
-A small local model took a plain database bug, called it a completely different kind of
-bug, and scored it 6.0 when it should have been about 9.8 — and **every check passed,
-correctly.** Nothing was invented. The bug type it named is real and on the list. The
-score genuinely follows from the answers it gave. It simply gave the wrong answers:
-well-formed, traceable, checkable, and wrong.
-
-**Grounding catches invention, not incompetence.** You can build a machine that catches
-a kid quoting a page that does not exist. You cannot build that same machine to catch a
-kid who quotes a real page and misunderstood it. That needs a second reader, a rule, or
-a human. This project does not close that gap and does not pretend to.
-
-### One finding, start to finish
+## 6. Project Structure
 
 ```
-1. Scanner says     : /product, parameter "id", payload "1' OR '1'='1",
-                      evidence "database error appeared in the response"
-2. Dedupe           : it tested ?id=1 and ?id=2 and reported both -> merged into one
-3. Model fills form : CWE-89 - internet-reachable, no login needed, reads private data
-                      "...This corresponds to CVE-2019-4471."
-4. Code does maths  : 9.8 Critical            <- the model never touched this number
-5. Code checks facts: "CVE-2019-4471" searched in the scanner's notes -> not there
-6. Struck out+flagged: "[UNVERIFIED REFERENCE REMOVED]"
-                       ⚠ invented CVE reference: CVE-2019-4471
-7. Exit code 1      : a pipeline will not send this report until a human has looked
+vuln-triage-agent/
+├── triage/                      # Core triage engine & domain logic
+│   ├── __init__.py              # Package entrypoint & version metadata
+│   ├── agent.py                 # Triage agent orchestration & retry loops
+│   ├── cli.py                   # Command-line interface definition
+│   ├── grounding.py             # Grounding rules, consistency checks & redaction
+│   ├── llm.py                   # LLM backends (OpenAI, Ollama, Mock)
+│   ├── models.py                # Plain dataclasses & JSON schema definitions
+│   ├── parsers.py               # Ingestion parsers (VibeScanner, Burp, ZAP, Nmap)
+│   ├── report.py                # Markdown, HTML, and JSON report formatters
+│   └── tools.py                 # CVSS v3.1 calculator, CWE lookup, deduplication
+│
+├── webui/                       # Interactive Web Dashboard
+│   ├── __init__.py              # Web package initialization
+│   ├── app.py                   # FastAPI route handlers & API endpoints
+│   ├── security.py              # Rate limiting, input validation & render guards
+│   ├── static/                  # Vanilla CSS stylesheets & JavaScript
+│   └── templates/               # Jinja2 HTML dashboard template
+│
+├── data/                        # Authoritative catalogues and sample inputs
+│   ├── cwe.json                 # Curated CWE weakness dictionary & mitigations
+│   └── sample_scan.json         # Realistic multi-vulnerability scanner payload
+│
+├── evals/                       # Hallucination measurement harness
+│   ├── results.json             # Benchmark results on mock simulation
+│   ├── results_ollama.json      # Benchmark results on local Llama 3.2
+│   └── run_eval.py              # Script measuring ungrounded claims with grounding on/off
+│
+├── reports/                     # Pre-rendered sample reports
+│   ├── sample_report.html       # Standalone styled HTML assessment report
+│   ├── sample_report.json       # Structured machine-readable report
+│   └── sample_report.md         # Formatted Markdown report
+│
+├── tests/                       # Automated test suite
+│   ├── test_triage.py           # Engine, CVSS math, parsers & grounding tests
+│   └── test_webui.py            # API endpoint, security guards & rendering tests
+│
+├── .gitignore                   # Version control exclusion rules
+├── LICENSE                      # MIT Open Source License
+├── Procfile                     # Deployment process definition
+├── pyproject.toml               # Package build configuration & dependencies
+├── README.md                    # Project documentation
+├── render.yaml                  # Blueprint for zero-configuration Cloud deployment
+└── requirements.txt             # Pinned project dependencies
 ```
 
-### The whole thing in a paragraph
+---
 
-**A model can be a good judge but must never be a source of facts.** So it does the
-judging — how bad is this, how would you explain it — and everything else is taken away
-from it: numbers are computed by arithmetic, identifiers are looked up in a fixed list,
-and every remaining sentence is checked against what the scanner actually saw. What
-cannot be traced is struck out in red rather than quietly removed, and the report is
-held back until a person signs off. The goal is not "make the model more accurate." It
-is **assume it will make things up, and build everything downstream so that when it
-does, you find out.**
+## 7. Installation
 
-</details>
+### Prerequisites
+- Python 3.10 or higher
+- Git
 
-## The problem
-
-A scanner tells you `window_kitchen open`. A client needs to be told *what broke,
-how bad it is, and how to fix it*. Writing that up is most of the billable time on
-an assessment, and it is the same shape every time — which makes it automatable.
-
-The obvious approach is to hand the findings to an LLM. The obvious approach also
-produces this:
-
-> The `id` parameter is vulnerable to SQL injection. This corresponds to
-> **CVE-2019-4471**.
-
-That CVE does not exist. The model produced it because reports it has read
-contain identifiers of that shape, and a plausible-looking one was the most
-likely next token. It is not flagged as uncertain — it reads exactly like the
-sentence before it, which is true.
-
-Send that to a client, they look it up, and every other finding in the report
-becomes suspect. **That single failure mode is why generated security reports
-are not in wider use**, and it is what this project is actually about.
-
-## How it works
-
-```
-scanner JSON  ->  dedupe  ->  LLM fills a fixed schema  ->  validate (retry on failure)
-              ->  score computed from metrics BY CODE
-              ->  CWE resolved against a local catalogue
-              ->  grounding check on every remaining claim
-              ->  report
+### 1. Clone the repository
+```bash
+git clone https://github.com/venky099/vuln-triage-agent.git
+cd vuln-triage-agent
 ```
 
-Three design decisions do the work:
+### 2. Create and activate a virtual environment
+```bash
+# On Linux / macOS:
+python3 -m venv .venv
+source .venv/bin/activate
 
-**1. The model fills in a form, never a blank page.** It returns JSON against a
-fixed schema — title, CWE, eight CVSS metrics, summary, reproduction,
-remediation. A schema violation is *detectable*, so the agent tells the model
-what was wrong and asks again. Free-form prose has no such check.
-
-**2. The model is never allowed to state a number.** It chooses CVSS *metrics*
-(is confidentiality impact high? is user interaction required?) — judgement calls
-a model is reasonable at. The **score is then computed in code** from CVSS v3.1
-arithmetic. A model that is never asked for a number cannot invent one. The
-schema explicitly rejects a `cvss_score` field if the model tries to supply one.
-
-**3. Every claim must trace to a source, or it does not ship.** There are exactly
-two sources of truth: the scanner's own output, and a local CWE catalogue.
-
-| Check | Catches |
-|---|---|
-| CVE citations | An identifier not present anywhere in the scan data |
-| CWE identifiers | A CWE that is not in the catalogue |
-| CVSS score | A number that does not follow from the vector |
-| Score in prose | Prose disagreeing with the computed score |
-| URLs | An endpoint the scanner never touched |
-| Impact language | "remote code execution", "full compromise" — claims a single scanner finding cannot support |
-
-Ungrounded claims are **redacted and flagged**, not silently deleted:
-
-```
-Input supplied in q is reflected into the response without encoding.
-This corresponds to [UNVERIFIED REFERENCE REMOVED].
-
-⚠ Needs review before sending:
-  - invented CVE reference: CVE-2019-3253
+# On Windows (PowerShell):
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-The reviewer sees that something was removed and why. A defence whose failure
-mode is invisible is worse than none.
+### 3. Install dependencies
+```bash
+# Core CLI only (Zero external dependencies):
+pip install -e .
 
-**Note that verification happens in code, not by asking the model to check
-itself.** A model that hallucinated a CVE will confirm the CVE is real when
-asked — the same process produced both answers.
-
-## Results
-
-Two measurements, and they say different things.
-
-### Against a simulated adversarial model
-
-`python evals/run_eval.py -n 50` uses the mock backend, which fabricates a
-reference on a fixed subset of findings so the checks have something to catch:
-
-```
-GROUNDING OFF   9/50 findings carried an ungrounded claim  (18%)
-                  invented CVE reference   5
-                  CWE not in catalogue     4
-GROUNDING ON    0 surviving into the report
+# Full installation (Web UI, testing, and OpenAI support):
+pip install -r requirements.txt && pip install -e .
 ```
 
-**These numbers describe the simulation, not a language model.** They demonstrate
-that the checks work when fabrication occurs. They say nothing about how often it
-occurs.
+---
 
-### Against a real model
+## 8. Configuration
 
-`python evals/run_eval.py -n 20 --backend ollama` with **llama3.2:3b**:
+Environment variables configure backend selection and server security controls:
 
-```
-GROUNDING OFF   0/20 findings carried an ungrounded claim  (0%)
-GROUNDING ON    0 flagged, 0 surviving
-schema retries  0
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_BACKEND` | Auto-detected | Forces `mock`, `ollama`, or `openai`. |
+| `LLM_MODEL` | Provider default | Model name (e.g. `gpt-4o-mini` or `llama3.2`). |
+| `OPENAI_API_KEY` | None | API key for OpenAI backend. |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Network address of local Ollama daemon. |
+| `TRIAGE_RATE` | `15` | Maximum requests per minute per IP on web endpoints. |
+| `TRIAGE_PROXY_DEPTH` | `1` | Reverse proxy depth for parsing `X-Forwarded-For`. |
 
-**It fabricated nothing.** No invented CVEs, no CWEs outside the catalogue, no
-URLs it had not been given, and it satisfied the output schema on every single
-attempt without a retry.
+---
 
-The most likely reason is that fabrication was prevented upstream rather than
-caught downstream: the system prompt forbids CVE citations outright, the schema
-constrains `cwe_id` to a pattern, and the allowed CWE list is supplied in the
-context. **Grounding is defence in depth here, not the primary control** — which
-is a better place for it to be, and not what I expected to find.
+## 9. Usage
 
-### The failure it did have, which grounding does not catch
-
-The same model, on a plain SQL injection with a database error in the evidence:
-
-```
-cwe    : CWE-22 Path Traversal              <- wrong class entirely
-vector : CVSS:3.1/AV:P/AC:H/PR:H/UI:R/...   <- AV:P means physical access
-score  : 6.0 Medium                          <- should be around 9.8 Critical
-flags  : none
-```
-
-Nothing here is fabricated. CWE-22 is real and in the catalogue, the vector is
-well formed, and 6.0 genuinely follows from those metrics — so every check passes,
-correctly.
-
-**Grounding catches invention, not incompetence.** A small model produces
-confident, well formed, entirely wrong triage and nothing in this project stops
-it. Detecting that would need a different mechanism: a second model disagreeing,
-a rule that a database error implies CWE-89, or a human. That gap is real and it
-is not closed.
-
-### Scope of these numbers
-
-One model, 20 synthetic findings, one run. Not a benchmark. A larger model would
-behave differently in both directions — likely better triage, and possibly more
-confident fabrication, which is exactly the case the checks exist for.
-
-## Install and run
+### Command-Line Interface (CLI)
 
 ```bash
-git clone https://github.com/venky099/vuln-triage-agent
-cd vuln-triage-agent
-python -m venv .venv && .venv\Scripts\activate     # Windows
-# source .venv/bin/activate                         # macOS / Linux
+# Triage a scan and output Markdown to stdout using auto-detected backend
+vulntriage data/sample_scan.json
 
-python -m triage.cli data/sample_scan.json                    # markdown to stdout
-python -m triage.cli data/sample_scan.json -f html -o r.html  # styled HTML report
-python evals/run_eval.py -n 50                                # the measurement
-pytest -q                                                     # 97 tests
+# Specify report target and export styled HTML
+vulntriage data/sample_scan.json --target "staging.example.com" -f html -o report.html
+
+# Export structured JSON report
+vulntriage data/sample_scan.json -f json -o report.json
+
+# Explicitly choose backend
+vulntriage data/sample_scan.json --backend mock
+vulntriage data/sample_scan.json --backend ollama
+vulntriage data/sample_scan.json --backend openai
+
+# Enable verbose debug logging
+vulntriage data/sample_scan.json -v
 ```
 
-No API key and no dependencies are needed for any of the above.
+### Interactive Web Dashboard
 
-The backend is auto-detected, so if Ollama happens to be running those commands
-use it and take about a minute per finding. Pass `--backend mock` for the instant
-version.
-
-Exit code is **1 when any finding carries an ungrounded claim**, so it can gate a
-pipeline: a report nobody has reviewed never ships automatically.
-
-### Backends
-
-| Backend | Setup |
-|---|---|
-| `mock` | none — the fallback when nothing else is available |
-| `ollama` | `ollama serve` and pull a model, then `LLM_BACKEND=ollama` |
-| `openai` | `pip install openai`, set `OPENAI_API_KEY`, then `LLM_BACKEND=openai` |
-
-Without `LLM_BACKEND` or `--backend`, the choice is made by detection: an
-`OPENAI_API_KEY` wins, else an Ollama with at least one model pulled, else mock.
-An open Ollama port with nothing pulled is not treated as available — selecting a
-backend that cannot answer turns the first documented command into a stack trace.
-`LLM_MODEL` is matched against the installed tags, so `llama3.2` finds
-`llama3.2:3b`.
-
-### Input formats
-
-VibeScanner JSON (primary), Burp Suite, OWASP ZAP, and Nmap. Detected automatically;
-override with `--input-format`.
-
-Burp is read in both shapes it ships in: Professional's report export (a flat `issues`
-array with HTML issue detail) and Enterprise/REST (each issue wrapped in an
-`issue_events` envelope).
-
-## Honesty note about the mock backend
-
-The default backend is **a simulation of a confident model, not a language
-model.** It fills the schema competently and, on a fixed seeded subset, does what
-real models do when pressed to sound authoritative: cites a CVE that does not
-exist, or a CWE outside the catalogue.
-
-That makes the mechanism reproducible and the grounding layer testable with zero
-setup. **It is not evidence about how any real model behaves.** Every number in
-the Results section above is a property of the simulation.
-
-The grounding checks, the CVSS arithmetic, the schema validation and the
-redaction are all real code operating on real text — only the model is simulated.
-Run `python evals/run_eval.py --backend ollama` and publish those numbers before
-making any claim about real-world hallucination rates.
-
-## Limitations
-
-- The CWE catalogue is 16 entries covering common web classes, not the full list.
-  A legitimate CWE outside it is rejected — a false positive by design, on the
-  principle that a missing citation beats a wrong one.
-- Grounding is lexical, not semantic. A claim that is subtly wrong but uses only
-  words present in the scan data will pass.
-- Impact overclaiming is pattern-matched against a fixed phrase list; a novel
-  phrasing gets through.
-- Deduplication keys on bug class plus endpoint plus parameter. Two genuinely
-  distinct bugs of the same class on one endpoint would be merged.
-- The eval's findings are synthetic. Real scanner output is messier.
-
-## Layout
-
+Start the local dashboard:
+```bash
+uvicorn webui.app:app --reload --port 8000
 ```
-triage/models.py      dataclasses + the output schema
-triage/tools.py       CVSS v3.1 scorer, CWE catalogue, dedupe
-triage/parsers.py     VibeScanner / Burp / ZAP / Nmap -> RawFinding
-triage/llm.py         openai | ollama | mock backends
-triage/agent.py       the loop: ask, validate, retry, compute, ground
-triage/grounding.py   the checks, and redaction
-triage/report.py      markdown / HTML / JSON
-evals/run_eval.py     hallucination measurement
-tests/                97 tests, no network needed
+Open `http://localhost:8000` in a browser to:
+1. Load or paste scanner output JSON.
+2. Select the execution backend (Simulated Mock, Local Ollama, or OpenAI).
+3. Toggle between **Raw Output** and **After Checks** to inspect redacted claims.
+4. Export finalized reports in Markdown, HTML, or JSON.
+
+---
+
+## 10. Sample Input
+
+Below is a typical scanner JSON finding accepted by the system (`data/sample_scan.json`):
+
+```json
+{
+  "target": "https://demo.vulnerable.example",
+  "scanner": "VibeScanner",
+  "findings": [
+    {
+      "id": "VS-001",
+      "type": "SQL Injection",
+      "url": "https://demo.vulnerable.example/product?id=1",
+      "parameter": "id",
+      "method": "GET",
+      "payload": "1' OR '1'='1",
+      "evidence": "MySQL syntax error present in response body."
+    }
+  ]
+}
 ```
 
-## Related
+---
 
-[VibeScanner](https://vibescanner.onrender.com) finds the bugs this triages —
-scanner output goes straight in as input.
+## 11. Sample Output
 
-[Indirect Prompt Injection Lab](https://github.com/venky099/rag-injection-lab) —
-the other side of the same coin. There, untrusted text reaches a model and it
-obeys. Here, a model produces untrusted text and something downstream believes
-it. Both are the same lesson: **a language model is not a source of truth, and
-whatever consumes its output has to act like it.**
+### Generated Markdown Report (Excerpt)
+
+```markdown
+### 1. SQL Injection in id at https://demo.vulnerable.example/product?id=1
+
+**Severity:** Critical (9.8)  
+**CVSS v3.1:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`  
+**Weakness:** CWE-89 — SQL Injection  
+**Source:** VS-001 (also seen as VS-002)
+
+The id parameter is concatenated into a SQL query. A crafted value changes the meaning of the query, exposing the database behind https://demo.vulnerable.example/product?id=1.
+
+**Reproduction**
+Send a GET request to https://demo.vulnerable.example/product?id=1 with id=1' OR '1'='1 and compare the response against a benign value.
+
+**Remediation**
+Use parameterised queries so id is bound as a value and never parsed as SQL.
+```
+
+If an ungrounded or fabricated claim is detected, it is visibly marked:
+```markdown
+**⚠ Needs review before sending:**
+- invented CVE reference: CVE-2019-3253
+```
+
+---
+
+## 12. Evaluation and Testing
+
+### Automated Test Suite
+The repository includes **115 automated unit and regression tests** covering CVSS math, parsers, schema compliance, rate limiting, and security validation:
+
+```bash
+pytest -v
+```
+
+### Hallucination Measurement (`evals/run_eval.py`)
+The evaluation script synthesizes findings to measure hallucination rates across identical runs with grounding disabled vs. enabled:
+
+```bash
+# Run 50-finding simulation test
+python evals/run_eval.py -n 50 --backend mock
+
+# Run evaluation on local Ollama instance
+python evals/run_eval.py -n 20 --backend ollama
+```
+
+#### Benchmark Summary:
+- **Simulated Adversarial Mock (50 findings):**
+  - Grounding OFF: 18% of findings contained ungrounded claims (invented CVEs or unregistered CWEs).
+  - Grounding ON: 100% of invalid claims were flagged and intercepted; 0 leaked into final reports.
+- **Local Llama 3.2 (3B) Evaluation (20 findings):**
+  - Grounding OFF: 0 invented citations, demonstrating that strict schema design and negative system prompts prevent most hallucinations upstream.
+
+---
+
+## 13. Security Considerations
+
+- **Indirect Prompt Injection Defense:** System instructions explicitly order the LLM to treat all scanner payloads, headers, and evidence as untrusted data.
+- **No API Key Storage:** In the web UI, client-provided API keys are held in request scope only, never written to disk, and never included in error logs.
+- **Server Log Isolation:** Errors logged to server consoles record technical stack traces without exposing user tokens or sensitive finding data.
+- **Strict Web Request Validation:** The `/api/render` endpoint validates string lengths, numerical CVSS boundaries, qualitative severity values, and list limits to protect against Denial of Service (DoS) and data corruption.
+- **In-Memory Thread-Safe Rate Limiting:** Sliding-window rate limiting protects single-instance deployments against brute-force or flooding attacks.
+- **Context-Aware HTML Escaping:** Pre-rendered HTML reports escape all dynamic and client-controlled inputs, mitigating Cross-Site Scripting (XSS).
+
+---
+
+## 14. Known Limitations
+
+- **Lexical Matching:** Grounding checks currently compare endpoints and tokens lexically. A subtly incorrect technical statement composed entirely of words present in the scan evidence will not be caught.
+- **Catalogue Size:** The bundled CWE catalogue contains 16 representative web vulnerability classes. Legitimate CWEs outside this catalogue are flagged for verification.
+- **Impact Phrase List:** Overclaim detection uses regex patterns. Novel expressions of extreme impact may bypass pattern filters.
+- **Single Instance Limiter:** The in-memory rate limiter is designed for single-node deployments; horizontal scaling requires an external cache.
+
+---
+
+## 15. Future Improvements
+
+- **Semantic Embedding Grounding:** Complement lexical checks with vector similarity checks against authoritative security knowledge bases.
+- **SARIF Standard Support:** Add a native parser for OASIS SARIF (Static Analysis Results Interchange Format) to support SAST scanners.
+- **Expanded CWE Catalog:** Expand the reference dataset to include the complete CWE Top 25 and OWASP Top 10 2021 catalogues.
+- **Automated Verification Probes:** Optional active verification plugins to replay HTTP reproduction steps against non-production endpoints.
+
+---
+
+## 16. License
+
+This project is licensed under the terms of the [MIT License](LICENSE).

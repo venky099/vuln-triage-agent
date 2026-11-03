@@ -1,16 +1,17 @@
 {
   "backend": "mock",
-  "sample_size": 30,
+  "sample_size": 50,
   "grounding_off": {
-    "findings_with_ungrounded_claims": 6,
-    "total_violations": 6,
+    "findings_with_ungrounded_claims": 9,
+    "total_violations": 13,
     "by_category": {
-      "CWE not in catalogue": 2,
-      "invented CVE reference": 4
+      "CWE not in catalogue": 4,
+      "classification mismatch": 4,
+      "invented CVE reference": 5
     }
   },
   "grounding_on": {
-    "findings_flagged": 6,
+    "findings_flagged": 9,
     "ungrounded_claims_in_published_text": 0,
     "schema_retries": 0
   },

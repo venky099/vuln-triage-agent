@@ -1,6 +1,6 @@
 {
   "target": "https://demo.vulnerable.example",
-  "generated": "2026-08-20",
+  "generated": "2026-11-03",
   "backend": "mock",
   "counts": {
     "Critical": 1,
@@ -28,7 +28,8 @@
         "VS-002"
       ],
       "flags": [
-        "CWE not in catalogue: CWE-781"
+        "CWE not in catalogue: CWE-781",
+        "classification mismatch: scanner reported 'SQL Injection' (commonly CWE-89), but finding was assigned CWE-781 \u2014 manual verification recommended"
       ]
     },
     {

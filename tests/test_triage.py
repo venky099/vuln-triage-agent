@@ -549,3 +549,200 @@ def test_burp_findings_run_through_the_whole_pipeline():
     assert triaged.cwe_id == "CWE-89"
     assert triaged.cvss_score == 9.8
     assert triaged.severity == "Critical"
+
+
+# --------------------------- Classification Consistency & Hardening ---------------------------
+
+def test_classification_consistency_mismatch_flagged():
+    """When a scanner reports SQL Injection but model assigns Path Traversal (CWE-22),
+    flag for manual verification rather than silently passing."""
+    r = raw(kind="SQL Injection")
+    t = triaged(cwe_id="CWE-22", cwe_name="Path Traversal")
+    flags = check(r, t)
+    assert any("classification mismatch" in f for f in flags)
+    assert any("CWE-89" in f for f in flags)
+
+
+def test_classification_consistency_matching_has_no_mismatch_flag():
+    """Matching vulnerability classification and CWE produces no mismatch flag."""
+    r = raw(kind="Reflected XSS")
+    t = triaged(cwe_id="CWE-79", cwe_name="Cross-site Scripting")
+    flags = check(r, t)
+    assert not any("classification mismatch" in f for f in flags)
+
+
+def test_enforce_retains_mismatched_valid_cwe_with_flag():
+    """A valid catalogue CWE with a classification mismatch is retained for reviewer
+    inspection, but the finding is flagged."""
+    r = raw(kind="SQL Injection")
+    t = triaged(cwe_id="CWE-22", cwe_name="Path Traversal")
+    enforced = enforce(r, t)
+    assert enforced.cwe_id == "CWE-22"
+    assert not enforced.grounded
+    assert any("classification mismatch" in f for f in enforced.flags)
+
+
+def test_severity_mismatch_against_vector_is_caught():
+    """A finding with a Critical vector but stated as Low severity is flagged."""
+    t = triaged(severity="Low")
+    flags = check(raw(), t)
+    assert any("severity rating 'Low' does not match" in f for f in flags)
+
+
+@pytest.mark.parametrize("phrase", [
+    "This allows arbitrary code execution on the underlying host.",
+    "Attacker gains complete database takeover via this flaw.",
+    "Grants root access to the target environment.",
+])
+def test_expanded_overclaims_caught(phrase):
+    t = triaged(summary=phrase)
+    flags = check(raw(), t)
+    assert any("unsupported impact claim" in f for f in flags)
+    enforced = enforce(raw(), t)
+    assert "[UNSUPPORTED CLAIM REMOVED]" in enforced.summary
+
+
+def test_get_backend_unknown_raises_value_error():
+    from triage.llm import get_backend
+    with pytest.raises(ValueError, match="Unknown LLM_BACKEND"):
+        get_backend("nonexistent_backend")
+
+
+def test_is_transient_error_detection():
+    from triage.agent import is_transient_error
+
+    class CustomRateLimit(Exception):
+        status_code = 429
+
+    class FakeAPIConnectionError(Exception):
+        pass
+
+    assert is_transient_error(ConnectionError("Reset"))
+    assert is_transient_error(TimeoutError("Timeout"))
+    assert is_transient_error(CustomRateLimit("429"))
+    assert is_transient_error(FakeAPIConnectionError("dropped"))
+    assert not is_transient_error(ValueError("Bad input"))
+
+
+def test_load_non_existent_file_raises():
+    with pytest.raises(FileNotFoundError):
+        load("non_existent_scan_file_12345.json")
+
+
+def test_load_non_dict_non_list_json_raises(tmp_path):
+    p = tmp_path / "invalid_type.json"
+    p.write_text("12345", encoding="utf-8")
+    with pytest.raises(ValueError, match="Expected a JSON object or array"):
+        load(p)
+
+
+def test_parser_resilience_on_malformed_zap_elements():
+    malformed = {
+        "site": [
+            "not a dict site",
+            {"alerts": ["not a dict alert", {"instances": ["not a dict instance"]}]},
+        ]
+    }
+    findings = parse_zap(malformed)
+    assert len(findings) == 1
+    assert findings[0].scanner == "OWASP ZAP"
+
+
+# --------------------------- Explicit 8-Bug Regression Tests ---------------------------
+
+def test_bug1_retry_on_mocked_provider_rate_limit():
+    """Bug 1: Transient provider rate limits must be retried and succeed."""
+    class RateLimitBackend(MockBackend):
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, system, user):
+            self.calls += 1
+            if self.calls == 1:
+                class RateLimitError(Exception):
+                    status_code = 429
+                raise RateLimitError("429 Too Many Requests")
+            return super().complete_json(system, user)
+
+    agent = TriageAgent(backend=RateLimitBackend(), backoff=0)
+    result = agent.run([raw(id="RL-1")])
+    assert len(result.findings) == 1
+    assert result.findings[0].source_id == "RL-1"
+    assert result.errors == []
+
+
+def test_bug2_corroborated_impact_claim_not_flagged():
+    """Bug 2: When scanner evidence explicitly mentions remote code execution,
+    the impact claim is verified by the evidence corpus and NOT flagged."""
+    supported_raw = raw(evidence="Scanner confirmed remote code execution vulnerability.")
+    t = triaged(summary="Vulnerability enables remote code execution.")
+    flags = check(supported_raw, t)
+    assert not any("unsupported impact claim" in f for f in flags)
+
+    # When NOT corroborated in evidence, it must still be caught
+    unsupported_raw = raw(evidence="Generic input reflection.")
+    unsupported_flags = check(unsupported_raw, t)
+    assert any("unsupported impact claim" in f for f in unsupported_flags)
+
+
+def test_bug3_cvss_methodology_prose_not_treated_as_score():
+    """Bug 3: 'CVSS 3.1 methodology' must not be mistaken for a numerical score of 3.1."""
+    t1 = triaged(summary="Severity follows CVSS 3.1 methodology.")
+    assert not any("does not match computed" in f for f in check(raw(), t1))
+
+    t2 = triaged(summary="Assessment executed under CVSS v3.1 framework.")
+    assert not any("does not match computed" in f for f in check(raw(), t2))
+
+    # An actual conflicting score statement must still be caught
+    t3 = triaged(summary="CVSS score: 4.2 according to analyst.")
+    assert any("does not match computed" in f for f in check(raw(), t3))
+
+
+def test_bug4_cli_quiet_still_outputs_missing_findings(tmp_path, monkeypatch, capsys):
+    """Bug 4: CLI with --quiet must always print failed/missing findings to stderr."""
+    from triage.cli import main
+
+    p = tmp_path / "failing_scan.json"
+    p.write_text(json.dumps({
+        "findings": [{"id": "FAIL-1", "type": "SQL Injection", "url": "https://t.example", "evidence": "err"}]
+    }), encoding="utf-8")
+
+    class AlwaysFailingBackend(MockBackend):
+        def complete_json(self, system, user):
+            raise RuntimeError("API quota completely exhausted")
+
+    from triage import cli as cli_mod
+    monkeypatch.setattr(cli_mod, "get_backend", lambda *a, **kw: AlwaysFailingBackend())
+
+    exit_code = main([str(p), "--quiet", "--backend", "mock"])
+    assert exit_code == 1
+
+    captured = capsys.readouterr()
+    assert "finding(s) failed triage and are omitted from this report" in captured.err
+    assert "FAIL-1" in captured.err
+
+
+def test_bug6_malformed_vibescanner_input_handles_gracefully(tmp_path):
+    """Bug 6: Ingestion of non-dict finding in VibeScanner returns empty rather than crashing."""
+    from triage.parsers import parse_vibescanner
+    findings = parse_vibescanner({"findings": ["oops", None, 123]})
+    assert findings == []
+
+    p = tmp_path / "bad_vibe.json"
+    p.write_text(json.dumps({"findings": ["oops"]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="No findings parsed"):
+        load(p)
+
+
+def test_bug7_cwe_validation_rejects_trailing_newlines_and_extra_chars():
+    """Bug 7: re.fullmatch rejects trailing newlines and trailing characters in CWE IDs."""
+    with pytest.raises(SchemaError):
+        validate(good_payload(cwe_id="CWE-89\n"))
+
+    with pytest.raises(SchemaError):
+        validate(good_payload(cwe_id="CWE-89-extra"))
+
+    with pytest.raises(SchemaError):
+        validate(good_payload(cwe_id="CWE-89\r"))
+
+
