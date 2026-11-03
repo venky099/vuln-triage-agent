@@ -114,7 +114,8 @@ vuln-triage-agent/
 │   └── EXPLAINER.md             # Detailed guide to grounding & deterministic scoring
 │
 ├── data/                        # Authoritative catalogues and sample inputs
-│   └── cwe_catalogue.json       # Curated CWE weakness dictionary & mitigations
+│   ├── cwe.json                 # Curated CWE weakness dictionary & mitigations
+│   └── sample_scan.json         # Realistic multi-vulnerability scanner payload
 │
 ├── evals/                       # Hallucination measurement harness
 │   ├── results.json             # Benchmark results on mock simulation (n=50)

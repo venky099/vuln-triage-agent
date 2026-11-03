@@ -7,7 +7,7 @@ services:
     name: vuln-triage-agent
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && pip install -e .
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn webui.app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:

@@ -226,9 +226,23 @@ class OllamaBackend(Backend):
         return (body.get("message", {}).get("content") or "").strip()
 
 
+def _ollama_alive(host: str | None = None) -> bool:
+    """Check if the Ollama service port is responsive."""
+    import socket
+    from urllib.parse import urlparse
+    p = urlparse(host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"))
+    try:
+        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 11434), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
 def ollama_models(host: str | None = None) -> list[str]:
     """Retrieve the list of models currently pulled in the Ollama instance."""
     base_host = (host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")).rstrip("/")
+    if not _ollama_alive(base_host):
+        return []
     try:
         req = urllib.request.Request(f"{base_host}/api/tags")
         with urllib.request.urlopen(req, timeout=2) as resp:
@@ -254,17 +268,6 @@ def resolve_ollama_model(name: str | None, available: list[str]) -> str | None:
             return candidate
     return None
 
-
-def _ollama_alive() -> bool:
-    """Check if the Ollama service port is responsive."""
-    import socket
-    from urllib.parse import urlparse
-    p = urlparse(os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"))
-    try:
-        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 11434), timeout=0.4):
-            return True
-    except OSError:
-        return False
 
 
 def get_backend(name: str | None = None, api_key: str | None = None) -> Backend:

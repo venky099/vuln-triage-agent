@@ -28,12 +28,14 @@ _CWE_CACHE: dict[str, dict[str, str]] | None = None
 
 
 def cwe_catalogue() -> dict[str, dict[str, str]]:
-    """Return the cached CWE dictionary loaded from data/cwe.json."""
+    """Return the cached CWE dictionary loaded from data/cwe.json or data/cwe_catalogue.json."""
     global _CWE_CACHE
     if _CWE_CACHE is None:
         cwe_file = DATA / "cwe.json"
         if not cwe_file.exists():
-            raise FileNotFoundError(f"Authoritative CWE catalogue not found at {cwe_file}")
+            cwe_file = DATA / "cwe_catalogue.json"
+        if not cwe_file.exists():
+            raise FileNotFoundError(f"Authoritative CWE catalogue not found at {DATA / 'cwe.json'}")
         _CWE_CACHE = json.loads(cwe_file.read_text(encoding="utf-8"))
     return _CWE_CACHE
 
