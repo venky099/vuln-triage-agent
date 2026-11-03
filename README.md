@@ -13,6 +13,9 @@ The **Vulnerability Triage Agent** automates this pipeline using language models
 - **Claims are verified against ground truth:** Every CVE reference, CWE identifier, URL endpoint, and impact claim is validated against raw scanner evidence and an authoritative CWE catalogue.
 - **Hallucinations are detected and redacted:** Untraceable or fabricated citations are flagged for human review and redacted from final reports.
 
+> [!NOTE]
+> For a comprehensive technical deep-dive into the architectural design, deterministic CVSS arithmetic, schema retry loops, and why LLMs fail at self-auditing, see [docs/EXPLAINER.md](docs/EXPLAINER.md).
+
 ---
 
 ## 2. Problem Statement
@@ -107,12 +110,14 @@ vuln-triage-agent/
 │   ├── static/                  # Vanilla CSS stylesheets & JavaScript
 │   └── templates/               # Jinja2 HTML dashboard template
 │
+├── docs/                        # Technical design and architecture guides
+│   └── EXPLAINER.md             # Detailed guide to grounding & deterministic scoring
+│
 ├── data/                        # Authoritative catalogues and sample inputs
-│   ├── cwe.json                 # Curated CWE weakness dictionary & mitigations
-│   └── sample_scan.json         # Realistic multi-vulnerability scanner payload
+│   └── cwe_catalogue.json       # Curated CWE weakness dictionary & mitigations
 │
 ├── evals/                       # Hallucination measurement harness
-│   ├── results.json             # Benchmark results on mock simulation
+│   ├── results.json             # Benchmark results on mock simulation (n=50)
 │   ├── results_ollama.json      # Benchmark results on local Llama 3.2
 │   └── run_eval.py              # Script measuring ungrounded claims with grounding on/off
 │
@@ -121,9 +126,13 @@ vuln-triage-agent/
 │   ├── sample_report.json       # Structured machine-readable report
 │   └── sample_report.md         # Formatted Markdown report
 │
-├── tests/                       # Automated test suite
+├── tests/                       # Automated test suite (122 tests)
 │   ├── test_triage.py           # Engine, CVSS math, parsers & grounding tests
 │   └── test_webui.py            # API endpoint, security guards & rendering tests
+│
+├── .github/                     # Automated workflows
+│   └── workflows/
+│       └── tests.yml            # Multi-version CI matrix (Python 3.10, 3.11, 3.12)
 │
 ├── .gitignore                   # Version control exclusion rules
 ├── LICENSE                      # MIT Open Source License
@@ -161,11 +170,17 @@ python -m venv .venv
 
 ### 3. Install dependencies
 ```bash
-# Core CLI only (Zero external dependencies):
+# Option A: Core CLI only (Zero external dependencies, standard library only):
 pip install -e .
 
-# Full installation (Web UI, testing, and OpenAI support):
-pip install -r requirements.txt && pip install -e .
+# Option B: Core CLI + Interactive Web Dashboard:
+pip install -e ".[web]"
+
+# Option C: Complete development environment (Web, pytest suite, and linters):
+pip install -e ".[web,dev]"
+
+# Or install all dependencies via requirements.txt:
+pip install -r requirements.txt
 ```
 
 ---
@@ -207,6 +222,16 @@ vulntriage data/sample_scan.json --backend openai
 # Enable verbose debug logging
 vulntriage data/sample_scan.json -v
 ```
+
+#### CLI Exit Codes
+
+The CLI returns standard exit codes suitable for CI/CD automation and quality gates:
+
+| Exit Code | Status | Description |
+|---|---|---|
+| `0` | **Success** | All findings triaged cleanly with zero ungrounded claims and zero processing errors. |
+| `1` | **Review Required / Missing Findings** | One or more findings require manual verification (flagged for ungrounded citations, impact overclaims, or classification discrepancies) **or** one or more scanner findings failed triage due to persistent errors and were omitted from the report. Summaries of failed findings are always output to `stderr` even when `--quiet` is enabled. |
+| `2` | **Configuration / IO Error** | Invalid scanner input file, unparseable input format, unavailable backend, or file write failure. |
 
 ### Interactive Web Dashboard
 
@@ -278,7 +303,7 @@ If an ungrounded or fabricated claim is detected, it is visibly marked:
 ## 12. Evaluation and Testing
 
 ### Automated Test Suite
-The repository includes **115 automated unit and regression tests** covering CVSS math, parsers, schema compliance, rate limiting, and security validation:
+The repository includes **122 automated unit and regression tests** covering CVSS math, parsers, schema compliance, rate limiting, and security validation:
 
 ```bash
 pytest -v
